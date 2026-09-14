@@ -1,17 +1,19 @@
 import asyncio
-import json
-import re
 import time
 from datetime import datetime, timezone
 
-import httpx
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 
+from app.sources import SourceFetchError
+from app.sources.baidu import fetch_baidu_hot
+from app.sources.github import fetch_github_python_trending
+from app.sources.v2ex import fetch_v2ex_hot
+
 app = FastAPI(
-    title="Daily Hot Crawler API",
+    title="Helonx Daily Hot API",
     description="A personal hot-list API built with Python.",
-    version="0.1.0",
+    version="0.2.0",
 )
 
 app.add_middleware(
@@ -20,77 +22,85 @@ app.add_middleware(
         "https://leehelonx.github.io",
         "http://localhost:3000",
         "http://127.0.0.1:3000",
+        "http://localhost:3001",
+        "http://127.0.0.1:3001",
+        "http://172.16.3.8:3000",
     ],
     allow_methods=["GET"],
     allow_headers=["*"],
 )
 
-BAIDU_HOT_URL = "https://top.baidu.com/board?tab=realtime"
-CACHE_SECONDS = 600
-_cache: dict[str, object] = {"items": [], "expires_at": 0.0, "fetched_at": None}
-_cache_lock = asyncio.Lock()
+CACHE_SECONDS = 3600
 
+SOURCES = {
+    "baidu": {
+        "title": "百度",
+        "type": "实时热搜",
+        "fetch": fetch_baidu_hot,
+    },
+    "v2ex": {
+        "title": "V2EX",
+        "type": "热门话题",
+        "fetch": fetch_v2ex_hot,
+    },
+    "github": {
+        "title": "GitHub",
+        "type": "Python Trending",
+        "fetch": fetch_github_python_trending,
+    },
+}
 
-async def fetch_baidu_hot() -> list[dict[str, object]]:
-    """Fetch and normalize public items from Baidu's realtime hot board."""
-    headers = {
-        "User-Agent": "HelonxDailyHot/0.1 (+https://leehelonx.github.io)",
-        "Accept-Language": "zh-CN,zh;q=0.9",
+_cache = {
+    source: {
+        "items": [],
+        "expires_at": 0.0,
+        "fetched_at": None,
     }
-    try:
-        async with httpx.AsyncClient(timeout=15, headers=headers) as client:
-            response = await client.get(BAIDU_HOT_URL)
-            response.raise_for_status()
-    except httpx.HTTPError as error:
-        raise HTTPException(status_code=502, detail="百度热搜暂时无法获取") from error
+    for source in SOURCES
+}
 
-    match = re.search(r"<!--s-data:(\{.*?\})-->", response.text, re.S)
-    if not match:
-        raise HTTPException(status_code=502, detail="百度热搜页面结构已变化")
-
-    try:
-        payload = json.loads(match.group(1))
-        cards = payload["data"]["cards"]
-        content = next(card["content"] for card in cards if card.get("component") == "hotList")
-    except (KeyError, StopIteration, json.JSONDecodeError) as error:
-        raise HTTPException(status_code=502, detail="百度热搜数据解析失败") from error
-
-    return [
-        {
-            "rank": rank,
-            "title": item["word"],
-            "url": item["url"],
-            "hot_score": item.get("hotScore"),
-            "description": item.get("desc", ""),
-        }
-        for rank, item in enumerate(content, start=1)
-    ]
+_locks = {source: asyncio.Lock() for source in SOURCES}
 
 
-async def get_baidu_hot() -> tuple[list[dict[str, object]], bool, str]:
+def now_iso() -> str:
+    """返回当前 UTC 时间，写入接口响应。"""
+    return datetime.now(timezone.utc).isoformat()
+
+
+async def get_hot_list(source: str):
+    """优先返回缓存；缓存失效后才向来源请求新数据。"""
+    cache = _cache[source]
     now = time.monotonic()
-    cached_items = _cache["items"]
-    if cached_items and now < float(_cache["expires_at"]):
-        return cached_items, True, str(_cache["fetched_at"])
 
-    async with _cache_lock:
+    if cache["items"] and now < cache["expires_at"]:
+        return cache["items"], True, False, cache["fetched_at"]
+
+    async with _locks[source]:
         now = time.monotonic()
-        cached_items = _cache["items"]
-        if cached_items and now < float(_cache["expires_at"]):
-            return cached_items, True, str(_cache["fetched_at"])
 
-        items = await fetch_baidu_hot()
-        _cache["items"] = items
-        _cache["expires_at"] = now + CACHE_SECONDS
-        _cache["fetched_at"] = datetime.now(timezone.utc).isoformat()
-        return items, False, str(_cache["fetched_at"])
+        if cache["items"] and now < cache["expires_at"]:
+            return cache["items"], True, False, cache["fetched_at"]
+
+        try:
+            items = await SOURCES[source]["fetch"]()
+        except SourceFetchError as error:
+            if cache["items"]:
+                return cache["items"], True, True, cache["fetched_at"]
+
+            raise HTTPException(status_code=502, detail=str(error)) from error
+
+        cache["items"] = items
+        cache["expires_at"] = now + CACHE_SECONDS
+        cache["fetched_at"] = now_iso()
+
+        return items, False, False, cache["fetched_at"]
 
 
 @app.get("/")
 async def root():
     return {
         "name": "daily-hot-crawler-api",
-        "message": "API is running. Baidu hot search is available at /hot/baidu.",
+        "message": "API is running. See /all for available sources.",
     }
 
 
@@ -99,13 +109,37 @@ async def health():
     return {"status": "ok"}
 
 
-@app.get("/hot/baidu")
-async def baidu_hot(limit: int = Query(default=20, ge=1, le=50)):
-    """Return a cached subset of Baidu realtime hot-search items."""
-    items, cached, fetched_at = await get_baidu_hot()
+@app.get("/all")
+async def all_sources():
     return {
-        "source": "baidu",
+        "code": 200,
+        "data": [
+            {
+                "source": source,
+                "title": config["title"],
+                "type": config["type"],
+                "endpoint": f"/hot/{source}",
+            }
+            for source, config in SOURCES.items()
+        ],
+    }
+
+
+@app.get("/hot/{source}")
+async def hot_list(source: str, limit: int = Query(default=20, ge=1, le=50)):
+    if source not in SOURCES:
+        raise HTTPException(status_code=404, detail="不支持该热榜来源")
+
+    items, cached, stale, fetched_at = await get_hot_list(source)
+    config = SOURCES[source]
+
+    return {
+        "code": 200,
+        "source": source,
+        "title": config["title"],
+        "type": config["type"],
         "fetched_at": fetched_at,
         "cached": cached,
+        "stale": stale,
         "data": items[:limit],
     }
